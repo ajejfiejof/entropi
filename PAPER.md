@@ -116,20 +116,22 @@ Entropi solves this via an in-memory **Circular Ring Buffer**:
 
 ---
 
-## 4. Formal SMT Verification
+## 4. Formal SMT Verification of Structural Invariants
 
-All mathematical and structural invariants were formally modeled and verified in Z3 SMT using first-order decidable theories (BitVectors, Arrays, and Reals):
+To guarantee that the sampling policy, array indexing, and epoch guards contain no arithmetic overflows or boundary bugs, we model key structural invariants in the **Z3 SMT Solver** ([`verify_entropi.py`](verify_entropi.py)). 
 
-| Theorem | Formal Invariant | Z3 Result |
+> **Methodological Note on SMT Verification Scope:** SMT solvers operating in decidable first-order theories verify structural and control-flow invariants (e.g., ring buffer bounds, sampling piecewise monotonicity, epoch filter gates). SMT does not replace empirical statistical testing or interactive theorem provers (Lean 4/Coq) for asymptotic probability distributions or hash collision analysis.
+
+| Theorem | Invariant Verified | Z3 SMT Property |
 | :--- | :--- | :---: |
-| **Theorem 1 (Information Monotonicity)** | $\forall p_1, p_2 \in (0, 1]: (p_1 \le p_2) \implies -\log_2(p_1) \ge -\log_2(p_2)$ | **100% PROVED** |
-| **Theorem 2 (Additive Independence)** | $\forall p_A, p_B > 0: I(p_A \cdot p_B) == I(p_A) + I(p_B)$ | **100% PROVED** |
-| **Theorem 3 (Sampling Monotonicity)** | $\forall \mathcal{S}_1 \le \mathcal{S}_2 \implies p_{\text{sample}}(\mathcal{S}_1) \le p_{\text{sample}}(\mathcal{S}_2)$ | **100% PROVED** |
-| **Theorem 4 (Error Guarantee)** | $\forall \text{status} \ge 500 \implies p_{\text{sample}} == 1.0$ | **100% PROVED** |
-| **Theorem 5 (Lattice Monotonicity)** | $\forall m_1, m_2 \in \mathbb{N}: (m_1 + m_2 \ge m_1) \land (m_1 + m_2 \ge m_2)$ | **100% PROVED** |
-| **Theorem 6 (Preimage Injectivity)** | $(k_1 \ne k_2 \lor v_1 \ne v_2) \implies \text{Concat}(k_1, v_1) \ne \text{Concat}(k_2, v_2)$ | **100% PROVED** |
-| **Theorem 7 (Circular Index Safety)** | $\forall \text{head} < 1024 \implies (\text{head} + 1) \bmod 1024 < 1024$ | **100% PROVED** |
-| **Theorem 8 (Epoch Poisoning Immunity)** | $|e_{\text{remote}} - e_{\text{local}}| > 1 \implies \text{Accept} == \text{False}$ | **100% PROVED** |
+| **Theorem 1 (Log Monotonicity)** | Sanity check on information monotonicity | $\forall p_1 \le p_2: -\log_2(p_1) \ge -\log_2(p_2)$ (Axiomatized) |
+| **Theorem 2 (Additive Independence)** | Information additivity for independent attributes | $I(p_A \cdot p_B) == I(p_A) + I(p_B)$ (Axiomatized) |
+| **Theorem 3 (Sampling Monotonicity)** | Monotonic piecewise surprise-to-probability mapping | $\mathcal{S}_1 \le \mathcal{S}_2 \implies p_{\text{sample}}(\mathcal{S}_1) \le p_{\text{sample}}(\mathcal{S}_2)$ |
+| **Theorem 4 (Error Guarantee)** | Unconditional retention of HTTP 5xx errors | $\text{status} \ge 500 \implies p_{\text{sample}} == 1.0$ |
+| **Theorem 5 (Lattice Monotonicity)** | Overflow-free additive count merge | $m_1, m_2 \le 2\times 10^9 \implies m_1 + m_2 \ge m_1$ |
+| **Theorem 6 (Tuple Separation)** | Injective concatenation of key-value bitvectors | $(k_1 \ne k_2 \lor v_1 \ne v_2) \implies (k_1 \parallel v_1) \ne (k_2 \parallel v_2)$ |
+| **Theorem 7 (Circular Index Safety)** | Pointer arithmetic stays strictly within ring buffer capacity | $\forall \text{head} < 1024 \implies (\text{head} + 1) \bmod 1024 < 1024$ |
+| **Theorem 8 (Epoch Poisoning Guard)** | Out-of-window gossip packets rejected | $|e_{\text{remote}} - e_{\text{local}}| > 1 \implies \text{Accept} == \text{False}$ |
 
 ---
 
