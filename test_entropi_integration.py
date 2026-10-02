@@ -133,8 +133,72 @@ def run_tests():
     print(f"  Retrieved span from circular buffer: {retrieved['name']} (trace={test_trace_id[:8]}...)")
     print("  [100% PROVED]  Circular ring buffer enables retroactive parent trace promotion!")
 
+    # -------------------------------------------------------------
+    # TEST 6: Distributed Multi-Hop Trace Cohesion (A -> B)
+    # -------------------------------------------------------------
+    print("\n[Test 6] Distributed Multi-Hop Trace Cohesion & Retroactive Promotion")
+    # Simulate Service A (API Gateway) and Service B (Payment Microservice)
+    gateway_exp = InMemorySpanExporter()
+    gateway_proc = EntropiSpanProcessor(exporter=gateway_exp, base_rate=0.001)
+    gateway_prov = TracerProvider()
+    gateway_prov.add_span_processor(gateway_proc)
+    gateway_tracer = gateway_prov.get_tracer("service.gateway")
+
+    payment_exp = InMemorySpanExporter()
+    payment_proc = EntropiSpanProcessor(exporter=payment_exp, base_rate=0.001)
+    payment_prov = TracerProvider()
+    payment_prov.add_span_processor(payment_proc)
+    payment_tracer = payment_prov.get_tracer("service.payment")
+
+    # Step 1: Gateway executes root span (nominal HTTP request)
+    with gateway_tracer.start_as_current_span("POST /checkout") as gw_span:
+        gw_span.set_attribute("http.route", "/checkout")
+        gw_span.set_attribute("http.status_code", 200)
+        trace_id_int = gw_span.get_span_context().trace_id
+        trace_id_str = format(trace_id_int, "032x")
+
+    # Verify Gateway initially suppressed the root span (nominal)
+    assert len(gateway_exp.get_finished_spans()) == 0, "Nominal root span must initially be suppressed"
+    print(f"  [6a] Gateway root span {trace_id_str[:8]}... created -> Initially suppressed by Entropi")
+
+    # Step 2: Downstream Payment service executes child span and triggers 500 error!
+    from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, set_span_in_context
+    parent_ctx = set_span_in_context(NonRecordingSpan(
+        SpanContext(
+            trace_id=trace_id_int,
+            span_id=0x1122334455667788,
+            is_remote=True,
+            trace_flags=TraceFlags(0x01)
+        )
+    ))
+
+    with payment_tracer.start_as_current_span("payment_charge", context=parent_ctx) as pay_span:
+        pay_span.set_attribute("payment.method", "credit_card")
+        pay_span.set_attribute("http.status_code", 500)
+        pay_span.set_status(Status(StatusCode.ERROR, "GatewayTimeoutOnStripe"))
+
+    # Verify Payment emitted its error span immediately
+    assert len(payment_exp.get_finished_spans()) == 1, "Payment error span must be emitted"
+    print("  [6b] Downstream Payment service failed with 500 ERROR -> Emitted to Payment exporter")
+
+    # Step 3: Payment returns response with retroactive promotion header
+    downstream_headers = {
+        "x-entropi-retroactive": f"sample=1;trace_id={trace_id_str}",
+        "content-type": "application/json",
+    }
+
+    # Step 4: Gateway receives header and triggers retroactive promotion
+    promoted_count = gateway_proc.handle_downstream_response_headers(downstream_headers)
+    assert promoted_count == 1, f"Must promote 1 parent span, got {promoted_count}"
+    assert len(gateway_exp.get_finished_spans()) == 1, "Gateway exporter must now have the promoted root span!"
+    
+    gw_exported = gateway_exp.get_finished_spans()[0]
+    assert format(gw_exported.context.trace_id, "032x") == trace_id_str
+    print(f"  [6c] Gateway received retroactive header -> Promoted parent span {gw_exported.name}!")
+    print("  [100% PROVED]  Distributed trace cohesion preserved across microservice hops!")
+
     print("\n" + "=" * 80)
-    print("ALL 5 OPENTELEMETRY INTEGRATION TESTS PASSED WITH 100% SUCCESS!")
+    print("ALL 6 OPENTELEMETRY INTEGRATION TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 80)
     return True
 

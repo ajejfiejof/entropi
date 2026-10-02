@@ -266,7 +266,7 @@ class RetroactiveRingBuffer:
     """Fixed-Size Circular Ring Buffer for Retroactive Trace Retention.
 
     Prevents broken, headless distributed traces. Holds the most recent
-    N spans in memory (e.g. 1,000 spans ~= 500 KB). If a downstream service
+    N spans in memory (e.g. 1,024 spans ~= 512 KB). If a downstream service
     encounters a high-surprise anomaly, the root span and intermediate spans
     can be retroactively promoted and emitted.
     """
@@ -274,7 +274,7 @@ class RetroactiveRingBuffer:
     def __init__(self, capacity: int = 1024):
         self.capacity = capacity
         self.buffer: List[Optional[Dict[str, Any]]] = [None] * capacity
-        self.index_by_trace: Dict[str, int] = {}
+        self.index_by_trace: Dict[str, List[int]] = {}
         self.head = 0
 
     def push(self, span: Dict[str, Any]) -> None:
@@ -283,22 +283,43 @@ class RetroactiveRingBuffer:
         old = self.buffer[self.head]
         if old is not None:
             old_trace = old.get("trace_id")
-            if old_trace in self.index_by_trace and self.index_by_trace[old_trace] == self.head:
-                del self.index_by_trace[old_trace]
+            if old_trace in self.index_by_trace:
+                self.index_by_trace[old_trace] = [
+                    idx for idx in self.index_by_trace[old_trace] if idx != self.head
+                ]
+                if not self.index_by_trace[old_trace]:
+                    del self.index_by_trace[old_trace]
 
         self.buffer[self.head] = span
         trace_id = span.get("trace_id")
         if trace_id:
-            self.index_by_trace[trace_id] = self.head
+            if trace_id not in self.index_by_trace:
+                self.index_by_trace[trace_id] = []
+            self.index_by_trace[trace_id].append(self.head)
 
         self.head = (self.head + 1) % self.capacity
 
     def get_by_trace_id(self, trace_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve cached span for retroactive promotion."""
-        idx = self.index_by_trace.get(trace_id)
-        if idx is not None and self.buffer[idx] is not None:
-            return self.buffer[idx]
-        return None
+        """Retrieve most recent cached span for a given trace_id."""
+        spans = self.get_spans_by_trace_id(trace_id)
+        return spans[-1] if spans else None
+
+    def get_spans_by_trace_id(self, trace_id: str) -> List[Dict[str, Any]]:
+        """Retrieve all cached spans for a given trace_id."""
+        indices = self.index_by_trace.get(trace_id, [])
+        return [self.buffer[idx] for idx in indices if self.buffer[idx] is not None]
+
+    def promote_trace(self, trace_id: str) -> List[Dict[str, Any]]:
+        """Promotes and marks all un-emitted spans for this trace_id as emitted.
+
+        Returns list of newly promoted spans.
+        """
+        promoted = []
+        for span in self.get_spans_by_trace_id(trace_id):
+            if not span.get("emitted", False):
+                span["emitted"] = True
+                promoted.append(span)
+        return promoted
 
     def size_bytes(self) -> int:
         """Approximate RAM usage."""

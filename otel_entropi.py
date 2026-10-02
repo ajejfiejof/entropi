@@ -52,6 +52,7 @@ class EntropiSpanProcessor(SpanProcessor):
             tau_crit=tau_crit,
         )
         self.ring_buffer = RetroactiveRingBuffer(capacity=ring_buffer_capacity)
+        self.flagged_traces: set[str] = set()
         self.spans_seen = 0
         self.spans_emitted = 0
         self.anomalies_caught = 0
@@ -95,6 +96,11 @@ class EntropiSpanProcessor(SpanProcessor):
             has_exception=has_exception,
         )
 
+        # Check if this trace was flagged retroactively by downstream call during execution
+        if trace_id_hex in self.flagged_traces:
+            should_sample = True
+            self.flagged_traces.discard(trace_id_hex)
+
         span_record = {
             "name": span.name,
             "trace_id": trace_id_hex,
@@ -105,6 +111,7 @@ class EntropiSpanProcessor(SpanProcessor):
             "surprise_bits": surprise,
             "sample_probability": p_sample,
             "emitted": should_sample,
+            "span_obj": span,
         }
 
         # Store in circular ring buffer for potential retroactive parent promotion
@@ -117,6 +124,38 @@ class EntropiSpanProcessor(SpanProcessor):
 
             if self.exporter is not None:
                 self.exporter.export([span])
+
+    def promote_trace(self, trace_id: str) -> List[Dict[str, Any]]:
+        """Retroactively promotes and exports un-emitted parent spans for trace_id.
+
+        Triggered when a downstream microservice signals an anomaly via W3C or
+        HTTP retroactive headers.
+        """
+        promoted = self.ring_buffer.promote_trace(trace_id)
+        if promoted:
+            self.spans_emitted += len(promoted)
+            self.anomalies_caught += len(promoted)
+            if self.exporter is not None:
+                spans_to_export = [p["span_obj"] for p in promoted if "span_obj" in p]
+                if spans_to_export:
+                    self.exporter.export(spans_to_export)
+        return promoted
+
+    def handle_downstream_response_headers(self, headers: Dict[str, str]) -> int:
+        """Parses downstream response headers and triggers retroactive promotion if flagged.
+
+        Supported headers:
+        - `x-entropi-retroactive`: format `sample=1;trace_id=<hex>`
+        """
+        for k, v in headers.items():
+            if k.lower() == "x-entropi-retroactive":
+                parts = dict(p.strip().split("=", 1) for p in v.split(";") if "=" in p)
+                if parts.get("sample") == "1" and "trace_id" in parts:
+                    tid = parts["trace_id"]
+                    self.flagged_traces.add(tid)
+                    promoted = self.promote_trace(tid)
+                    return len(promoted)
+        return 0
 
     def shutdown(self) -> None:
         if self.exporter is not None and hasattr(self.exporter, "shutdown"):
@@ -135,3 +174,35 @@ class EntropiSpanProcessor(SpanProcessor):
             "reduction_percent": (1.0 - (self.spans_emitted / max(1, self.spans_seen))) * 100.0,
             "memory_bytes": self.lattice.size_bytes() + self.ring_buffer.size_bytes(),
         }
+
+
+class EntropiFlaskMiddleware:
+    """Drop-in Flask middleware for automatic retroactive trace cohesion.
+
+    1. Injects `x-entropi-retroactive: sample=1;trace_id=<hex>` into outgoing responses
+       if the current trace encountered high Shannon surprise or an error.
+    2. Allows upstream services to immediately retrieve and export suppressed parent spans.
+    """
+
+    def __init__(self, app: Any, processor: EntropiSpanProcessor):
+        self.app = app
+        self.processor = processor
+        self._init_middleware()
+
+    def _init_middleware(self) -> None:
+        @self.app.after_request
+        def _after_request(response: Any) -> Any:
+            try:
+                curr_span = trace.get_current_span()
+                if curr_span and curr_span.get_span_context().is_valid:
+                    trace_id = format(curr_span.get_span_context().trace_id, "032x")
+                    cached = self.processor.ring_buffer.get_spans_by_trace_id(trace_id)
+                    # If any span in this trace was anomalous or emitted
+                    if any(
+                        s.get("emitted") and (s.get("status_code", 200) >= 500 or s.get("surprise_bits", 0) >= self.processor.engine.tau_crit)
+                        for s in cached
+                    ):
+                        response.headers["x-entropi-retroactive"] = f"sample=1;trace_id={trace_id}"
+            except Exception:
+                pass
+            return response

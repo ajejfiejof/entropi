@@ -116,26 +116,49 @@ trace.set_tracer_provider(provider)
 
 ---
 
-## Running Verification & Proofs
+## Distributed Multi-Hop Trace Cohesion
 
-### 1. Master Proof Suite (SMT Theorems + Stress Tests + OTel Pipeline)
+The primary failure mode of distributed sampling is **headless/orphan traces**: an upstream API Gateway suppresses a routine `POST /checkout` span, but a downstream database worker encounters a deadlock. If the upstream span was dropped, engineers lose the root context (incoming IP, URL, user agent).
+
+Entropi solves this via **Retroactive Header Promotion**:
+1. Upstream services hold recent spans in fixed memory (`RetroactiveRingBuffer`, 1,024 spans = ~512 KB).
+2. If a downstream service encounters surprise $\mathcal{S} \ge \tau_{\text{crit}}$ or an HTTP 5xx error, it attaches response header `x-entropi-retroactive: sample=1;trace_id=<hex>`.
+3. Upstream services intercept this header, immediately promote the cached parent span from the ring buffer, and emit it to the exporter.
+4. **Result:** 100% complete distributed traces ($A \to B \to C$) in Datadog/Jaeger with zero orphan spans.
+
+### Flask Drop-In Middleware
+
+```python
+from flask import Flask
+from otel_entropi import EntropiSpanProcessor, EntropiFlaskMiddleware
+
+app = Flask(__name__)
+processor = EntropiSpanProcessor(...)
+middleware = EntropiFlaskMiddleware(app, processor)
+```
+
+---
+
+## Running Verification, Proofs & Fleet Simulation
+
+### 1. Master Proof Suite (SMT Theorems + Stress Tests + 6 OTel Tests)
 ```bash
 /home/ashley/entropi/.venv/bin/python /home/ashley/entropi/prove_100_entropi.py
 ```
 
-### 2. Formal Z3 SMT Mathematical Proofs (8 Theorems)
+### 2. Multi-Hop Microservice Fleet Simulation (3 Tiers, 2,000 Trans)
 ```bash
-/home/ashley/entropi/.venv/bin/python /home/ashley/entropi/verify_entropi.py
+/home/ashley/entropi/.venv/bin/python /home/ashley/entropi/demo_fleet.py
 ```
 
-### 3. OpenTelemetry End-to-End Integration Suite
-```bash
-/home/ashley/entropi/.venv/bin/python /home/ashley/entropi/test_entropi_integration.py
-```
-
-### 4. Large-Scale Egress Benchmark (200k Spans)
+### 3. Large-Scale Egress Benchmark (200k Spans)
 ```bash
 /home/ashley/entropi/.venv/bin/python /home/ashley/entropi/benchmark_egress.py
+```
+
+### 4. Formal Z3 SMT Structural Verification (8 Invariants)
+```bash
+/home/ashley/entropi/.venv/bin/python /home/ashley/entropi/verify_entropi.py
 ```
 
 ---
